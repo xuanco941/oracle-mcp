@@ -451,5 +451,279 @@ server.registerTool(
     })
 );
 
+server.registerTool(
+  "oracle_list_plsql",
+  {
+    description:
+      "List PL/SQL objects (procedure, function, package, package body, trigger, type) accessible to the current user.",
+    inputSchema: {
+      owner: z
+        .string()
+        .optional()
+        .describe("Optional schema/owner name. Defaults to current user."),
+      objectType: z
+        .enum([
+          "PROCEDURE",
+          "FUNCTION",
+          "PACKAGE",
+          "PACKAGE BODY",
+          "TRIGGER",
+          "TYPE",
+          "TYPE BODY",
+        ])
+        .optional()
+        .describe("Filter by object type."),
+      namePattern: z
+        .string()
+        .optional()
+        .describe("Optional object name pattern with % wildcard, e.g. CALC%."),
+      status: z
+        .enum(["VALID", "INVALID", "ALL"])
+        .optional()
+        .describe("Filter by object status (default ALL)."),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(500)
+        .optional()
+        .describe("Maximum number of objects to return (default 100)."),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ owner, objectType, namePattern, status = "ALL", limit = 100 }) =>
+    withConnection(async (conn) => {
+      const result = await conn.execute(
+        `SELECT owner,
+                object_type,
+                object_name,
+                status,
+                TO_CHAR(last_ddl_time, 'YYYY-MM-DD HH24:MI:SS') AS last_ddl_time
+         FROM all_objects
+         WHERE object_type IN ('PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY','TRIGGER','TYPE','TYPE BODY')
+           AND (:owner IS NULL OR owner = UPPER(:owner))
+           AND (:objectType IS NULL OR object_type = :objectType)
+           AND (:namePattern IS NULL OR object_name LIKE UPPER(:namePattern))
+           AND (:status = 'ALL' OR status = :status)
+         ORDER BY owner, object_type, object_name
+         FETCH FIRST :limit ROWS ONLY`,
+        {
+          owner: owner?.toUpperCase() ?? null,
+          objectType: objectType ?? null,
+          namePattern: namePattern ? namePattern.toUpperCase() : null,
+          status,
+          limit,
+        },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      return jsonResult(result.rows ?? []);
+    })
+);
+
+server.registerTool(
+  "oracle_list_triggers",
+  {
+    description: "List triggers defined on a specific table.",
+    inputSchema: {
+      table: z.string().describe("Table name."),
+      owner: z
+        .string()
+        .optional()
+        .describe("Optional schema/owner name. Defaults to current user."),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ table, owner }) =>
+    withConnection(async (conn) => {
+      const result = await conn.execute(
+        `SELECT t.owner,
+                t.trigger_name,
+                t.trigger_type,
+                t.triggering_event,
+                t.status,
+                DBMS_LOB.SUBSTR(t.trigger_body, 4000, 1) AS trigger_body
+         FROM all_triggers t
+         WHERE t.table_name = UPPER(:table)
+           AND (:owner IS NULL OR t.table_owner = UPPER(:owner))
+         ORDER BY t.trigger_name`,
+        {
+          table,
+          owner: owner?.toUpperCase() ?? null,
+        },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      return jsonResult(result.rows ?? []);
+    })
+);
+
+server.registerTool(
+  "oracle_list_package_subprograms",
+  {
+    description:
+      "List procedures and functions defined inside a package (spec and/or body).",
+    inputSchema: {
+      package: z.string().describe("Package name."),
+      owner: z
+        .string()
+        .optional()
+        .describe("Optional schema/owner name. Defaults to current user."),
+      subobjectType: z
+        .enum(["PACKAGE", "PACKAGE BODY", "ALL"])
+        .optional()
+        .describe("Limit to spec, body, or both (default ALL)."),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({
+    package: pkg,
+    owner,
+    subobjectType = "ALL",
+  }) =>
+    withConnection(async (conn) => {
+      const result = await conn.execute(
+        `SELECT owner,
+                object_type,
+                procedure_name AS subprogram_name,
+                overload,
+                subprogram_id
+         FROM all_procedures
+         WHERE object_name = UPPER(:pkg)
+           AND (:owner IS NULL OR owner = UPPER(:owner))
+           AND (:subobjectType = 'ALL' OR object_type = :subobjectType)
+           AND (procedure_name IS NULL OR procedure_name <> object_name)
+         ORDER BY object_type, subprogram_id, procedure_name`,
+        {
+          pkg,
+          owner: owner?.toUpperCase() ?? null,
+          subobjectType,
+        },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      return jsonResult(result.rows ?? []);
+    })
+);
+
+server.registerTool(
+  "oracle_object_errors",
+  {
+    description:
+      "Show PL/SQL compilation errors for invalid objects (from all_errors).",
+    inputSchema: {
+      name: z
+        .string()
+        .optional()
+        .describe(
+          "Optional object name. If omitted, list errors for all invalid objects."
+        ),
+      owner: z
+        .string()
+        .optional()
+        .describe("Optional schema/owner name."),
+      type: z
+        .string()
+        .optional()
+        .describe(
+          "Optional object type, e.g. PACKAGE BODY, TRIGGER, VIEW."
+        ),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(500)
+        .optional()
+        .describe("Maximum number of error rows to return (default 100)."),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ name, owner, type, limit = 100 }) =>
+    withConnection(async (conn) => {
+      const result = await conn.execute(
+        `SELECT owner,
+                name,
+                type,
+                sequence# AS sequence_no,
+                line,
+                position,
+                attribute,
+                message_text,
+                TO_CHAR(created, 'YYYY-MM-DD HH24:MI:SS') AS created
+         FROM all_errors
+         WHERE (:name IS NULL OR name = UPPER(:name))
+           AND (:owner IS NULL OR owner = UPPER(:owner))
+           AND (:type IS NULL OR type = UPPER(:type))
+         ORDER BY owner, name, type, sequence#
+         FETCH FIRST :limit ROWS ONLY`,
+        {
+          name: name ? name.toUpperCase() : null,
+          owner: owner?.toUpperCase() ?? null,
+          type: type ? type.toUpperCase() : null,
+          limit,
+        },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      return jsonResult(result.rows ?? []);
+    })
+);
+
+server.registerTool(
+  "oracle_get_source",
+  {
+    description:
+      "Get PL/SQL source code of a stored object (procedure, function, package, package body, trigger, type) from all_source.",
+    inputSchema: {
+      name: z.string().describe("Object name."),
+      type: z
+        .enum([
+          "PROCEDURE",
+          "FUNCTION",
+          "PACKAGE",
+          "PACKAGE BODY",
+          "TRIGGER",
+          "TYPE",
+          "TYPE BODY",
+        ])
+        .describe("Object type."),
+      owner: z
+        .string()
+        .optional()
+        .describe("Optional schema/owner name. Defaults to current user."),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ name, type, owner }) =>
+    withConnection(async (conn) => {
+      const result = await conn.execute(
+        `SELECT line, text
+         FROM all_source
+         WHERE name = UPPER(:name)
+           AND type = :type
+           AND (:owner IS NULL OR owner = UPPER(:owner))
+         ORDER BY line`,
+        {
+          name,
+          type,
+          owner: owner?.toUpperCase() ?? null,
+        },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT, fetchInfo: { TEXT: { type: oracledb.STRING } } }
+      );
+
+      const source = (result.rows ?? [])
+        .map((row) => row.TEXT ?? row.text ?? "")
+        .join("");
+
+      return jsonResult({
+        name,
+        type,
+        owner: owner?.toUpperCase() ?? null,
+        lineCount: result.rows?.length ?? 0,
+        source,
+      });
+    })
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
