@@ -70,6 +70,35 @@ function resolveMaxRows(requested) {
   return Math.min(Math.max(requested, 1), MAX_ALLOWED_ROWS);
 }
 
+// Only simple, qualified PL/SQL identifiers are allowed for the callable name,
+// e.g. MY_PROC, MY_PKG.GET_DATA, SCHEMA.MY_PKG.GET_DATA. This prevents the name
+// from being used to inject arbitrary statements into the anonymous block.
+const PROGRAM_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_$#]*(\.[A-Za-z][A-Za-z0-9_$#]*){0,2}$/;
+
+function mapBindType(type) {
+  switch (type) {
+    case "string":
+      return oracledb.STRING;
+    case "number":
+      return oracledb.NUMBER;
+    case "date":
+      return oracledb.DATE;
+    case "cursor":
+      return oracledb.CURSOR;
+    default:
+      return oracledb.STRING;
+  }
+}
+
+async function fetchCursorRows(cursor, maxRows) {
+  try {
+    const rows = await cursor.getRows(maxRows);
+    return rows;
+  } finally {
+    await cursor.close();
+  }
+}
+
 async function withConnection(fn) {
   let conn;
 
@@ -723,6 +752,151 @@ server.registerTool(
         source,
       });
     })
+);
+
+server.registerTool(
+  "oracle_execute_program",
+  {
+    description:
+      "Execute a stored PROCEDURE or FUNCTION (optionally inside a package) for READ/GET purposes only. " +
+      "The call always runs without commit and is rolled back afterwards, so any accidental " +
+      "INSERT/UPDATE/DELETE inside the program is discarded and never persisted. " +
+      "Use this for 'get data' programs that return values via the function return, OUT parameters, " +
+      "or a SYS_REFCURSOR OUT parameter.",
+    inputSchema: {
+      name: z
+        .string()
+        .describe(
+          "Callable name. May be qualified, e.g. MY_PROC, MY_PKG.GET_DATA, SCHEMA.MY_PKG.GET_DATA."
+        ),
+      kind: z
+        .enum(["PROCEDURE", "FUNCTION"])
+        .describe("Whether the callable is a PROCEDURE or a FUNCTION."),
+      returnType: z
+        .enum(["string", "number", "date", "cursor"])
+        .optional()
+        .describe(
+          "Required for FUNCTION: the type of the function's return value."
+        ),
+      params: z
+        .array(
+          z.object({
+            name: z
+              .string()
+              .describe("Bind/parameter name (without the colon)."),
+            dir: z
+              .enum(["in", "out", "inout"])
+              .describe("Parameter direction."),
+            type: z
+              .enum(["string", "number", "date", "cursor"])
+              .describe("Parameter type. Use 'cursor' for SYS_REFCURSOR."),
+            value: z
+              .union([z.string(), z.number(), z.boolean(), z.null()])
+              .optional()
+              .describe("Value for IN/INOUT parameters."),
+          })
+        )
+        .optional()
+        .describe("Ordered list of parameters passed to the program."),
+      maxRows: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_ALLOWED_ROWS)
+        .optional()
+        .describe(
+          `Maximum rows to fetch from any cursor output (default ${DEFAULT_MAX_ROWS}, max ${MAX_ALLOWED_ROWS}).`
+        ),
+    },
+    // Not strictly read-only at the database level, but we always roll back,
+    // so from the caller's perspective no changes are ever persisted.
+    annotations: { readOnlyHint: true },
+  },
+  async ({ name, kind, returnType, params = [], maxRows }) => {
+    if (!PROGRAM_NAME_PATTERN.test(name)) {
+      return textResult(
+        "Invalid program name. Use a simple qualified identifier, e.g. MY_PKG.GET_DATA."
+      );
+    }
+
+    if (kind === "FUNCTION" && !returnType) {
+      return textResult("returnType is required when kind is FUNCTION.");
+    }
+
+    const rowLimit = resolveMaxRows(maxRows);
+    const binds = {};
+    const placeholders = [];
+
+    for (const param of params) {
+      const bindType = mapBindType(param.type);
+      const isOut = param.dir === "out" || param.dir === "inout";
+      const isIn = param.dir === "in" || param.dir === "inout";
+
+      const bindDef = { type: bindType };
+      bindDef.dir = isOut
+        ? param.dir === "inout"
+          ? oracledb.BIND_INOUT
+          : oracledb.BIND_OUT
+        : oracledb.BIND_IN;
+
+      if (isIn) {
+        bindDef.val = param.value ?? null;
+      }
+
+      if (isOut && param.type === "string") {
+        bindDef.maxSize = 32767;
+      }
+
+      binds[param.name] = bindDef;
+      placeholders.push(`:${param.name}`);
+    }
+
+    let plsql;
+    if (kind === "FUNCTION") {
+      binds.__ret = { dir: oracledb.BIND_OUT, type: mapBindType(returnType) };
+      if (returnType === "string") {
+        binds.__ret.maxSize = 32767;
+      }
+      plsql = `BEGIN :__ret := ${name}(${placeholders.join(", ")}); END;`;
+    } else {
+      plsql = `BEGIN ${name}(${placeholders.join(", ")}); END;`;
+    }
+
+    return withConnection(async (conn) => {
+      try {
+        const result = await conn.execute(plsql, binds, { autoCommit: false });
+
+        const outBinds = result.outBinds ?? {};
+        const output = {};
+
+        for (const [key, value] of Object.entries(outBinds)) {
+          if (value && typeof value.getRows === "function") {
+            output[key] = {
+              type: "cursor",
+              rows: await fetchCursorRows(value, rowLimit),
+            };
+          } else {
+            output[key] = value;
+          }
+        }
+
+        return jsonResult({
+          name,
+          kind,
+          returnValue: kind === "FUNCTION" ? output.__ret : undefined,
+          outBinds: output,
+          note: "Executed without commit; any changes were rolled back.",
+        });
+      } finally {
+        // Discard anything the program may have written.
+        try {
+          await conn.rollback();
+        } catch {
+          // ignore rollback errors
+        }
+      }
+    });
+  }
 );
 
 const transport = new StdioServerTransport();
