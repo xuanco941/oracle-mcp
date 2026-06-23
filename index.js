@@ -3,6 +3,20 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+// Convert Oracle national-character types (NCHAR / NVARCHAR2 / NCLOB) to
+// JavaScript strings so they don't arrive as Buffers or cause NCHAR errors,
+// especially when reading from SYS_REFCURSOR OUT parameters.
+oracledb.fetchTypeHandler = function (meta) {
+  if (
+    meta.dbType === oracledb.DB_TYPE_NCHAR ||
+    meta.dbType === oracledb.DB_TYPE_NVARCHAR ||
+    meta.dbType === oracledb.DB_TYPE_NCLOB
+  ) {
+    return { type: oracledb.STRING };
+  }
+  // Let all other types use the default mapping.
+};
+
 const FORBIDDEN_KEYWORDS =
   /\b(insert|update|delete|merge|drop|truncate|alter|create|grant|revoke|exec|execute|call|commit|rollback)\b/i;
 
