@@ -70,7 +70,7 @@ Thêm vào MCP settings (`mcp.json`):
         "ORACLE_CONNECT_STRING": "localhost:1521/XEPDB1",
         "ORACLE_MAX_ROWS": "100",
         "NODE_ORACLEDB_DRIVER_MODE": "thick",
-        "NODE_ORACLEDB_CLIENT_LIB_DIR": "C:/oracle/instantclient_21_13"
+        "NODE_ORACLEDB_CLIENT_LIB_DIR": "C:/instantclient-basic-windows.x64-23.26.2.0.0/instantclient_23_0"
       }
     }
   }
