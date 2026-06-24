@@ -3,10 +3,43 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+function initializeOracleClient() {
+  const requestedMode = (
+    process.env.NODE_ORACLEDB_DRIVER_MODE ??
+    process.env.ORACLEDB_DRIVER_MODE ??
+    ""
+  ).toLowerCase();
+  const clientLibDir =
+    process.env.NODE_ORACLEDB_CLIENT_LIB_DIR ??
+    process.env.ORACLE_CLIENT_LIB_DIR;
+
+  if (requestedMode !== "thick" && !clientLibDir) {
+    return;
+  }
+
+  const options = {};
+  if (clientLibDir) {
+    options.libDir = clientLibDir;
+  }
+
+  try {
+    oracledb.initOracleClient(options);
+  } catch (err) {
+    throw new Error(
+      "Failed to initialize node-oracledb Thick mode. " +
+        "Set NODE_ORACLEDB_CLIENT_LIB_DIR to your Oracle Instant Client directory, " +
+        "or remove NODE_ORACLEDB_DRIVER_MODE=thick to use Thin mode. " +
+        `Original error: ${err.message}`
+    );
+  }
+}
+
+initializeOracleClient();
+
 // Convert Oracle national-character types (NCHAR / NVARCHAR2 / NCLOB) to
 // JavaScript strings so they don't arrive as Buffers or cause NCHAR errors,
 // especially when reading from SYS_REFCURSOR OUT parameters.
-oracledb.fetchTypeHandler = function (meta) {
+function nationalCharacterFetchTypeHandler(meta) {
   if (
     meta.dbType === oracledb.DB_TYPE_NCHAR ||
     meta.dbType === oracledb.DB_TYPE_NVARCHAR ||
@@ -15,7 +48,9 @@ oracledb.fetchTypeHandler = function (meta) {
     return { type: oracledb.STRING };
   }
   // Let all other types use the default mapping.
-};
+}
+
+oracledb.fetchTypeHandler = nationalCharacterFetchTypeHandler;
 
 const FORBIDDEN_KEYWORDS =
   /\b(insert|update|delete|merge|drop|truncate|alter|create|grant|revoke|exec|execute|call|commit|rollback)\b/i;
@@ -43,11 +78,11 @@ function validateSelectOnly(sql) {
   }
 
   if (!/^\s*select\b/i.test(text)) {
-    return "Only SELECT queries are allowed.";
+    return "Only SELECT queries are allowed. To call a procedure or function, use oracle_execute_program instead of CALL/EXEC.";
   }
 
   if (FORBIDDEN_KEYWORDS.test(text)) {
-    return "Query contains forbidden keywords. Only SELECT is allowed.";
+    return "Query contains forbidden keywords. Only SELECT is allowed. To call a procedure or function, use oracle_execute_program instead of CALL/EXEC.";
   }
 
   return null;
@@ -88,6 +123,22 @@ function resolveMaxRows(requested) {
 // e.g. MY_PROC, MY_PKG.GET_DATA, SCHEMA.MY_PKG.GET_DATA. This prevents the name
 // from being used to inject arbitrary statements into the anonymous block.
 const PROGRAM_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_$#]*(\.[A-Za-z][A-Za-z0-9_$#]*){0,2}$/;
+const BIND_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_$#]*$/;
+
+function formatOracleError(err) {
+  const message = err?.message ?? String(err);
+
+  if (message.includes("NJS-100")) {
+    return (
+      `${message}\n\n` +
+      "NJS-100 means node-oracledb Thin mode cannot handle the database national character set. " +
+      "Enable Thick mode with Oracle Instant Client by setting NODE_ORACLEDB_DRIVER_MODE=thick " +
+      "and NODE_ORACLEDB_CLIENT_LIB_DIR to the Instant Client directory."
+    );
+  }
+
+  return message;
+}
 
 function mapBindType(type) {
   switch (type) {
@@ -120,7 +171,7 @@ async function withConnection(fn) {
     conn = await getConnection();
     return await fn(conn);
   } catch (err) {
-    return textResult(`Oracle error: ${err.message}`);
+    return textResult(`Oracle error: ${formatOracleError(err)}`);
   } finally {
     if (conn) {
       await conn.close();
@@ -840,8 +891,21 @@ server.registerTool(
     const rowLimit = resolveMaxRows(maxRows);
     const binds = {};
     const placeholders = [];
+    const seenParamNames = new Set();
 
     for (const param of params) {
+      if (!BIND_NAME_PATTERN.test(param.name)) {
+        return textResult(
+          "Invalid parameter name. Use a simple bind identifier, e.g. P_ID or OUT_CURSOR."
+        );
+      }
+
+      const normalizedParamName = param.name.toUpperCase();
+      if (seenParamNames.has(normalizedParamName)) {
+        return textResult(`Duplicate parameter name: ${param.name}.`);
+      }
+      seenParamNames.add(normalizedParamName);
+
       const bindType = mapBindType(param.type);
       const isOut = param.dir === "out" || param.dir === "inout";
       const isIn = param.dir === "in" || param.dir === "inout";
@@ -878,7 +942,11 @@ server.registerTool(
 
     return withConnection(async (conn) => {
       try {
-        const result = await conn.execute(plsql, binds, { autoCommit: false });
+        const result = await conn.execute(plsql, binds, {
+          autoCommit: false,
+          outFormat: oracledb.OUT_FORMAT_OBJECT,
+          fetchTypeHandler: nationalCharacterFetchTypeHandler,
+        });
 
         const outBinds = result.outBinds ?? {};
         const output = {};
